@@ -23,7 +23,35 @@ type ExampleReply struct {
 }
 
 // Add your RPC definitions here.
+type WorkerTask int
 
+const (
+	MAPTASK WorkerTask = iota
+	REDUCETASK
+	EXITTASK
+)
+
+type AskTaskArgs struct {
+}
+
+// AskTaskReply files表示任务的输入文件
+type AskTaskReply struct {
+	Task   WorkerTask
+	TaskID int
+	// 如果是map任务, 需要分为nReduce个中间文件
+	NReduce int
+	Files   []string
+}
+
+// FinTaskArgs files表示任务的输出文件
+type FinTaskArgs struct {
+	Task   WorkerTask
+	TaskID int
+	Files  []string
+}
+
+type FinTaskReply struct {
+}
 
 // Cook up a unique-ish UNIX-domain socket name
 // in /var/tmp, for the coordinator.
