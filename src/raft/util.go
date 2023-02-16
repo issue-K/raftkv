@@ -18,3 +18,23 @@ func LOG(format string, a ...interface{}) {
 	}
 	return
 }
+
+func ASSERT(expect bool) {
+	if !expect {
+		panic("assert失败.....")
+	}
+}
+
+func max(a int, b int) int {
+	if a < b {
+		return b
+	}
+	return a
+}
+
+func min(a int, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
