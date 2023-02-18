@@ -45,6 +45,10 @@ const (
 	Leader
 )
 
+const (
+	HeatBeatTime = 50 * time.Millisecond
+)
+
 type ApplyMsg struct {
 	CommandValid bool
 	Command      interface{}
@@ -78,8 +82,6 @@ type Raft struct {
 	applyCond *sync.Cond
 	applyAble bool
 	state     Role
-	// 在超时周期前收到过leader的信息
-	connectable bool
 	// 服务器已知最新的任期（在服务器首次启动时初始化为0，单调递增)
 	currentTerm int
 	// 当前任期内收到选票的 candidateId，如果没有投给任何候选人 则为空
@@ -95,9 +97,8 @@ type Raft struct {
 	nextIndex []int
 	// 对于每一台服务器，已知的已经复制到该服务器的最高日志条目的索引（初始值为0，单调递增）
 	matchIndex []int
-	// 对每一台机器, 开启一个go routinue同步日志, 不需要同步时用条件变量阻塞
-	syncLogCond   []*sync.Cond
-	shouldSyncLog []bool
+	// 开启定期发心跳的条件, 只在成为Leader时候signal
+	heartBeatCond *sync.Cond
 	// 最后一次收到leader消息的时间
 	lasLeaderMsgTime time.Time
 	// 超时计数器时间
@@ -110,11 +111,9 @@ type Raft struct {
 // return currentTerm and whether this server
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
-
-	var term int
-	var isleader bool
-	// Your code here (2A).
-	return term, isleader
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	return rf.currentTerm, rf.state == Leader
 }
 
 // save Raft's persistent state to stable storage,
@@ -201,9 +200,9 @@ type AppendEntriesArgs struct {
 
 type AppendEntriesReply struct {
 	// 当前任期，对于领导人而言 它会更新自己的任期
-	term int
+	Term int
 	// 如果跟随者所含有的条目和 prevLogIndex 以及 prevLogTerm 匹配上了，则为 true
-	success bool
+	Success bool
 }
 
 // example RequestVote RPC handler.
@@ -211,10 +210,11 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+	LOG("[ask RequestVote] %d任期为%d, 收到%d任期%d的投票请求", rf.me, rf.currentTerm, args.CandidateId, args.Term)
+	reply.VoteGranted = false
 	reply.Term = rf.currentTerm
 	// 无法接收比自己term小的节点
 	if rf.currentTerm > args.Term {
-		reply.VoteGranted = false
 		return
 	}
 	// 要么没投票, 要么本任期投票给了CandidateId, 且CandidateId日志比自己新
@@ -225,6 +225,10 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	if rf.votedFor == -1 || (rf.votedFor == args.CandidateId && logMoreNew) {
 		rf.votedFor = args.CandidateId
 		reply.VoteGranted = true
+		// 接收了投票, 那么需要重置超时计数器
+		rf.resetTimeout = true
+		rf.lasLeaderMsgTime = time.Now()
+		LOG("[agree RequestVote] %d任期为%d, 同意%d任期%d的投票请求", rf.me, rf.currentTerm, args.CandidateId, args.Term)
 	}
 
 	rf.updTerm(args.Term)
@@ -239,22 +243,29 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	reply.term = rf.currentTerm
+	reply.Term = rf.currentTerm
+	reply.Success = true
 	// 不接受任期比自己小的情况
 	if args.Term < rf.currentTerm {
-		reply.success = false
+		reply.Success = false
 		return
 	}
 	// 检查receiver是否存在PreLog这条日志
 	logLen := len(rf.log)
 	if logLen-1 < args.PrevLogIndex || rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
-		reply.success = false
+		reply.Success = false
 		return
 	}
+	// 接收本次的日志: 1、重置超时计数器 2、转换为Follower Todo: 当自己是leader时收到该rpc应该如何处理?
+	LOG("[accept AppendEntries] %d任期%d收到心跳包,%d任期%d", rf.me, rf.currentTerm, args.LeaderId, args.Term)
+	rf.resetTimeout = true
+	rf.lasLeaderMsgTime = time.Now()
+	rf.ToFollow()
+
 	// 开始同步日志
 	del := false
 	for i := args.PrevLogIndex + 1; i <= args.PrevLogIndex+len(args.Entries); i++ {
-		eid := i - args.PrevLogIndex
+		eid := i - args.PrevLogIndex - 1
 		// 如果原来没有这条日志, 或者之前某条日志冲突导致receiver之后的日志被删除, 直接append新日志即可
 		if logLen-1 < i || del {
 			rf.log = append(rf.log, args.Entries[eid])
@@ -262,7 +273,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		}
 		// 如果之前存在这条日志, 那么比较日志是否一致
 		if rf.log[i].Term != args.Entries[eid].Term {
-			rf.log = rf.log[:i]
+			rf.log[i] = args.Entries[eid]
+			rf.log = rf.log[:i+1]
 			del = true
 		}
 	}
@@ -290,14 +302,25 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 // if it's ever committed. the second return value is the current
 // term. the third return value is true if this server believes it is
 // the leader.
+
+// Start 如果这个server不是leader，返回false.
+// 否则，接收这条日志并立即返回
+// 不保证这条日志被提交，因为leader可能故障
+// 第一个返回值是命令将出现的索引 ,第二个参数是当前任期, 第三个参数返回true表示是否是leader
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
-	index := -1
-	term := -1
-	isLeader := true
-
 	// Your code here (2B).
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 
-	return index, term, isLeader
+	if rf.state == Leader {
+		return -1, -1, false
+	}
+	rf.log = append(rf.log, LogEntry{
+		Command: command,
+		Term:    rf.currentTerm,
+		Index:   len(rf.log),
+	})
+	return len(rf.log) - 1, rf.currentTerm, true
 }
 
 // Kill
@@ -322,8 +345,7 @@ func (rf *Raft) killed() bool {
 
 func (rf *Raft) StartElection() {
 	rf.mu.Lock()
-	rf.state = Candidate
-	rf.currentTerm++
+	rf.ToCandidate()
 
 	me := rf.me
 	term := rf.currentTerm
@@ -333,7 +355,7 @@ func (rf *Raft) StartElection() {
 
 	var votes atomic.Int32
 	votes.Store(1)
-	for id, _ := range rf.peers {
+	for id := range rf.peers {
 		if id == me {
 			continue
 		}
@@ -368,129 +390,139 @@ func (rf *Raft) StartElection() {
 			if reply.VoteGranted == true {
 				votes.Add(1)
 				if votes.Load() >= halfNum {
-					// 切换为leader
-					rf.state = Leader
+					// 切换为leader, 并马上广播一次心跳
+					rf.ToLeader()
 					// 马上广播一次心跳包
+					go rf.syncLogAndHeartBeat()
 				}
 			}
 		}(id)
 	}
 }
 
-func (rf *Raft) electionTicker() {
+// 目前的超时计数器逻辑
+// 每次随机一个超时时间, 然后用time.Sleep()以一个小的参数来驱动检查是否超时
+// 当需要重置超时计数器时, 直接将rf.resetTimeout置为true, 那么当timeoutTicker发现时候
+// 就会展开新的一轮循环, 重新随机超时时间
+func (rf *Raft) timeoutTicker() {
 	rf.lasLeaderMsgTime = time.Now()
 	for rf.killed() == false {
 		// 随机一个超时计数器
-		ms := 50 + (rand.Int63() % 300)
+		// rf.lasLeaderMsgTime = time.Now()
+		ms := 300 + (rand.Int63() % 250)
 		for {
+			time.Sleep(10 * time.Millisecond)
 			rf.mu.Lock()
-			// 判断当前超时计数器是否超时. wait为真表示没超时
+			// 判断当前超时计数器是否超时. wait为假表示超时
 			wait := rf.lasLeaderMsgTime.Add(time.Duration(ms) * time.Millisecond).After(time.Now())
 			if !wait || rf.resetTimeout {
+				rf.mu.Unlock()
 				break
 			}
 			rf.mu.Unlock()
-			time.Sleep(5 * time.Millisecond)
 		}
+
 		// 超时了 or 需要重置超时计数器. 检查是哪种情况
 		rf.mu.Lock()
+		// Leader可以无视超时计数器. 否则检查是否需要重置超时计数器
 		if rf.state == Leader || rf.resetTimeout {
 			rf.resetTimeout = false
 			rf.mu.Unlock()
 			continue
 		}
+		// 超时了, 需要转换为candidate, 并发起一轮投票请求
 		rf.mu.Unlock()
-		// 超时了, 需要开始新的一轮选举
-		rf.StartElection()
+		go rf.StartElection()
 	}
 }
 
-func (rf *Raft) heartBeatOne() {
+// 向所有peer同步日志(也用作心跳)
+func (rf *Raft) syncLogAndHeartBeat() {
 	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	LOG("[Leader Sync] %d在任期%d同步日志", rf.me, rf.currentTerm)
 	term := rf.currentTerm
 	me := rf.me
-	rf.mu.Unlock()
+	commitIndex := rf.commitIndex
+	nextIndex := make([]int, len(rf.nextIndex))
+	copy(nextIndex, rf.nextIndex)
+
 	for peer := range rf.peers {
-		go func(pid int) {
-			args := &AppendEntriesArgs{
-				Term:         term,
-				LeaderId:     me,
-				PrevLogIndex: 0,
-				PrevLogTerm:  0,
-				Entries:      nil,
-				LeaderCommit: 0,
-			}
-			reply := &AppendEntriesReply{
-				term:    term,
-				success: false,
-			}
-			ok := rf.sendAppendEntries(pid, args, reply)
-			if !ok {
-				return
-			}
-			rf.mu.Lock()
-			defer rf.mu.Unlock()
-			if term != rf.currentTerm || rf.state != Leader {
-				return
-			}
-			if reply.term > rf.currentTerm {
-				rf.updTerm(reply.term)
-			}
-		}(peer)
+		if peer == rf.me {
+			continue
+		}
+		var entries []LogEntry
+		if nextIndex[peer] < len(rf.log) {
+			// 由于不会修改, 所以使用切片应该是没问题的.....
+			entries = rf.log[nextIndex[peer]:]
+		}
+		ASSERT(nextIndex[peer]-1 <= len(rf.log)-1)
+		preLog := rf.log[nextIndex[peer]-1]
+		go rf.syncPeerLogOne(peer, term, me, commitIndex, nextIndex[peer], entries, preLog)
 	}
 }
 
-func (rf *Raft) syncPeerLog(pid int) {
+// 向一个peer同步日志
+func (rf *Raft) syncPeerLogOne(pid int, term int, me int, commitIndex int, nxtId int, entries []LogEntry, preLog LogEntry) {
+	// 开始同步日志了
+
+	args := &AppendEntriesArgs{
+		Term:         term,
+		LeaderId:     me,
+		PrevLogIndex: preLog.Index,
+		PrevLogTerm:  preLog.Term,
+		Entries:      entries,
+		LeaderCommit: commitIndex,
+	}
+	reply := &AppendEntriesReply{
+		Term:    term,
+		Success: false,
+	}
+	ok := rf.sendAppendEntries(pid, args, reply)
+	if !ok {
+		return
+	}
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	// 过时的回复
+	if term != rf.currentTerm || rf.state != Leader || rf.nextIndex[pid] != nxtId {
+		return
+	}
+	if reply.Term > rf.currentTerm {
+		rf.updTerm(reply.Term)
+		return
+	}
+	if reply.Success {
+		if len(entries) != 0 {
+			rf.nextIndex[pid] = entries[len(entries)-1].Index + 1
+			rf.matchIndex[pid] = entries[len(entries)-1].Index
+		}
+	} else {
+		rf.nextIndex[pid]--
+	}
+}
+
+// leader定时给peer发心跳包
+func (rf *Raft) heartBeatTicker() {
 	for !rf.killed() {
-		rf.syncLogCond[pid].L.Lock()
-		for !rf.shouldSyncLog[pid] {
-			rf.syncLogCond[pid].Wait()
+		// 等待成为Leader
+		rf.heartBeatCond.L.Lock()
+		for !rf.IsLeader() {
+			rf.heartBeatCond.Wait()
 		}
-		rf.syncLogCond[pid].L.Unlock()
-		// 开始同步日志了
-		rf.mu.Lock()
-		term := rf.currentTerm
-		me := rf.me
-		commitIndex := rf.commitIndex
-		preLog := rf.log[len(rf.log)-1]
-		entries := []LogEntry{rf.log[rf.nextIndex[pid]]}
-		rf.mu.Unlock()
-		args := &AppendEntriesArgs{
-			Term:         term,
-			LeaderId:     me,
-			PrevLogIndex: preLog.Index,
-			PrevLogTerm:  preLog.Term,
-			Entries:      entries,
-			LeaderCommit: commitIndex,
+		rf.heartBeatCond.L.Unlock()
+		// 开始定时发心跳包
+		for {
+			if !rf.IsLeader() {
+				break
+			}
+			go rf.syncLogAndHeartBeat()
+			time.Sleep(HeatBeatTime)
 		}
-		reply := &AppendEntriesReply{
-			term:    term,
-			success: false,
-		}
-		ok := rf.sendAppendEntries(pid, args, reply)
-		if !ok {
-			return
-		}
-		rf.mu.Lock()
-		if term != rf.currentTerm || rf.state != Leader {
-			rf.mu.Unlock()
-			continue
-		}
-		if reply.term > rf.currentTerm {
-			rf.updTerm(reply.term)
-			rf.mu.Unlock()
-			continue
-		}
-		if reply.success {
-			rf.nextIndex[pid]++
-			rf.matchIndex[pid]++
-		} else {
-			rf.nextIndex[pid]--
-		}
-		rf.mu.Unlock()
 	}
 }
 
+// 定期将commit的日志应用到applyCh
 func (rf *Raft) applyChTicker() {
 	for !rf.killed() {
 		// 等待条件变量
@@ -509,6 +541,7 @@ func (rf *Raft) applyChTicker() {
 			}
 			rf.applyCh <- msg
 		}
+		rf.applyAble = false
 		rf.mu.Unlock()
 	}
 }
@@ -516,13 +549,37 @@ func (rf *Raft) applyChTicker() {
 // 调用函数前保证对rf加锁过
 func (rf *Raft) updTerm(term int) {
 	if rf.currentTerm < term {
+		rf.votedFor = -1
 		rf.currentTerm = term
-		rf.state = Follower
+		rf.ToFollow()
 	}
 }
 
-func (rf *Raft) newElectionTimeout() {
+func (rf *Raft) ToFollow() {
+	rf.state = Follower
+}
 
+// ToCandidate
+// 使用本方法前需拥有锁
+// 对应图2中的conversion to Candidate的前三点.
+// 第四点发送RequestVote Rpc给所有peer在StartElection()中实现
+func (rf *Raft) ToCandidate() {
+	rf.state = Candidate
+	rf.currentTerm++
+	rf.votedFor = rf.me
+	LOG("[ToCandidate] %d超时, 发起新的一轮选举, 任期变为%d", rf.me, rf.currentTerm)
+}
+
+func (rf *Raft) ToLeader() {
+	LOG("[ToLeader] %d在任期%d成功当选", rf.me, rf.currentTerm)
+	rf.state = Leader
+	rf.heartBeatCond.Signal()
+}
+
+func (rf *Raft) IsLeader() bool {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	return rf.state == Leader
 }
 
 func (rf *Raft) ticker() {
@@ -530,16 +587,9 @@ func (rf *Raft) ticker() {
 
 		// Your code here (2A)
 		// Check if a leader election should be started.
-		if rf.state != Leader && !rf.connectable {
-			// 开始新一轮选举
-			go rf.StartElection()
-		}
+
 		// pause for a random amount of time between 50 and 350
 		// milliseconds.
-		// 检查在超时时间到期前是否能收到leader信息
-		rf.mu.Lock()
-		rf.connectable = false
-		rf.mu.Unlock()
 		ms := 50 + (rand.Int63() % 300)
 		time.Sleep(time.Duration(ms) * time.Millisecond)
 	}
@@ -566,7 +616,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// raft自身一些状态
 	rf.state = Follower
 	rf.currentTerm = 0
-	rf.connectable = false
 	rf.votedFor = -1
 
 	// 与log相关
@@ -574,7 +623,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.nextIndex = make([]int, len(rf.peers))
 	rf.matchIndex = make([]int, len(rf.peers))
 	for i := 0; i < len(rf.peers); i++ {
-		rf.nextIndex[i] = 0
+		rf.nextIndex[i] = 1
 		rf.matchIndex[i] = 0
 	}
 	rf.commitIndex = 0
@@ -584,6 +633,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.applyCond = sync.NewCond(&sync.Mutex{})
 	rf.applyAble = false
 	rf.applyCh = applyCh
+	// 与心跳相关
+	rf.heartBeatCond = sync.NewCond(&sync.Mutex{})
 	// 最后一次leader消息的时间, 这个等electionTicker执行前再执行吧..
 	// rf.lasLeaderMsgTime = time.Now()
 
@@ -591,8 +642,10 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.readPersist(persister.ReadRaftState())
 
 	// start ticker goroutine to start elections
-	go rf.ticker()
-	go rf.electionTicker()
+	// go rf.ticker()
+	LOG("[Make] %d启动...", rf.me)
+	go rf.heartBeatTicker()
+	go rf.timeoutTicker()
 	go rf.applyChTicker()
 	return rf
 }
