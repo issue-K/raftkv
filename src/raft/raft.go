@@ -18,6 +18,8 @@ package raft
 //
 
 import (
+	"6.5840/labgob"
+	"bytes"
 	//	"bytes"
 	"math/rand"
 	"sort"
@@ -131,6 +133,12 @@ func (rf *Raft) persist() {
 	// e.Encode(rf.yyy)
 	// raftstate := w.Bytes()
 	// rf.persister.Save(raftstate, nil)
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	_ = e.Encode(rf.currentTerm)
+	_ = e.Encode(rf.votedFor)
+	_ = e.Encode(rf.log)
+	rf.persister.Save(w.Bytes(), nil)
 }
 
 // restore previously persisted state.
@@ -151,6 +159,19 @@ func (rf *Raft) readPersist(data []byte) {
 	//   rf.xxx = xxx
 	//   rf.yyy = yyy
 	// }
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	var currentTerm int
+	var voteFor int
+	var log []LogEntry
+	if d.Decode(&currentTerm) != nil || d.Decode(&voteFor) != nil || d.Decode(&log) != nil {
+		LOG("[Persist ERROR] err")
+		panic("[Persist ERROR] err")
+	} else {
+		rf.currentTerm = currentTerm
+		rf.votedFor = voteFor
+		rf.log = log
+	}
 }
 
 // the service says it has created a snapshot that has
@@ -227,6 +248,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	logMoreNew := args.LastLogTerm > lasTerm || (args.LastLogTerm == lasTerm && args.LastLogIndex >= lasIndex)
 	if (rf.votedFor == -1 || rf.votedFor == args.CandidateId) && logMoreNew {
 		rf.votedFor = args.CandidateId
+		rf.persist()
 		reply.VoteGranted = true
 		// 接收了投票, 那么需要重置超时计数器
 		rf.resetTimeout = true
@@ -267,10 +289,12 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	// 开始同步日志
 	del := false
+	flag := false
 	for i := args.PrevLogIndex + 1; i <= args.PrevLogIndex+len(args.Entries); i++ {
 		eid := i - args.PrevLogIndex - 1
 		// 如果原来没有这条日志, 或者之前某条日志冲突导致receiver之后的日志被删除, 直接append新日志即可
 		if logLen-1 < i || del {
+			flag = true
 			rf.log = append(rf.log, args.Entries[eid])
 			continue
 		}
@@ -279,7 +303,11 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			rf.log[i] = args.Entries[eid]
 			rf.log = rf.log[:i+1]
 			del = true
+			flag = true
 		}
+	}
+	if flag {
+		rf.persist()
 	}
 	// LOG("[accept AppendEntries]节点%d当前日志情况%+v", rf.me, rf.log)
 	// 更新已提交的日志索引
@@ -325,6 +353,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		Term:    rf.currentTerm,
 		Index:   len(rf.log),
 	})
+	rf.persist()
 	LOG("[app entry] 接收日志[%d %d]", rf.currentTerm, len(rf.log)-1)
 	return len(rf.log) - 1, rf.currentTerm, true
 }
@@ -510,7 +539,14 @@ func (rf *Raft) syncPeerLogOne(pid int, term int, me int, commitIndex int, nxtId
 			rf.matchIndex[pid] = entries[len(entries)-1].Index
 		}
 	} else {
-		rf.nextIndex[pid]--
+		// 优化, 一次回退所有此任期的日志
+		// rf.nextIndex[pid]--
+		for i := rf.nextIndex[pid] - 1; i >= 0; i-- {
+			if rf.log[i].Term != rf.log[rf.nextIndex[pid]].Term {
+				rf.nextIndex[pid] = i
+				break
+			}
+		}
 	}
 }
 
@@ -536,8 +572,8 @@ func (rf *Raft) heartBeatTicker() {
 func (rf *Raft) applyChTicker() {
 	for !rf.killed() {
 		time.Sleep(10 * time.Millisecond)
-		rf.mu.Lock()
-		if rf.state == Leader {
+		if rf.IsLeader() {
+			rf.mu.Lock()
 			var ma []int
 			for peer, match := range rf.matchIndex {
 				if peer == rf.me {
@@ -548,12 +584,24 @@ func (rf *Raft) applyChTicker() {
 			sort.Ints(ma)
 			if rf.commitIndex > ma[len(ma)/2] {
 				LOG("rf.commitIndex = %d, ma = %v", rf.commitIndex, ma)
+				rf.mu.Unlock()
+				continue
+			}
+			if rf.log[ma[len(ma)/2]].Term != rf.currentTerm {
+				rf.mu.Unlock()
 				continue
 			}
 			ASSERT(rf.commitIndex <= ma[len(ma)/2])
 			rf.commitIndex = ma[len(ma)/2]
+			rf.mu.Unlock()
 		}
-		for rf.lastApplied < rf.commitIndex {
+
+		for !rf.killed() {
+			rf.mu.Lock()
+			if rf.lastApplied >= rf.commitIndex {
+				rf.mu.Unlock()
+				break
+			}
 			rf.lastApplied++
 			LOG("[[[[APPLY]]]]节点%d 发送entry id = %d", rf.me, rf.lastApplied)
 			msg := ApplyMsg{
@@ -561,10 +609,10 @@ func (rf *Raft) applyChTicker() {
 				Command:      rf.log[rf.lastApplied].Command,
 				CommandIndex: rf.log[rf.lastApplied].Index,
 			}
+			rf.mu.Unlock()
 			// Todo: 在发送给chan时还持有锁, 是否违反了https://pdos.csail.mit.edu/6.824/labs/raft-locking.txt的rule 4?
 			rf.applyCh <- msg
 		}
-		rf.mu.Unlock()
 	}
 }
 
@@ -575,6 +623,7 @@ func (rf *Raft) updTerm(term int) {
 		rf.currentTerm = term
 
 		rf.ToFollow()
+		rf.persist()
 	}
 }
 
@@ -590,6 +639,7 @@ func (rf *Raft) ToCandidate() {
 	rf.state = Candidate
 	rf.currentTerm++
 	rf.votedFor = rf.me
+	rf.persist()
 	LOG("[ToCandidate] %d超时, 发起新的一轮选举, 任期变为%d", rf.me, rf.currentTerm)
 }
 
