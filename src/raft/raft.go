@@ -20,6 +20,7 @@ package raft
 import (
 	//	"bytes"
 	"math/rand"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -46,7 +47,7 @@ const (
 )
 
 const (
-	HeatBeatTime = 50 * time.Millisecond
+	HeatBeatTime = 100 * time.Millisecond
 )
 
 type ApplyMsg struct {
@@ -78,10 +79,9 @@ type Raft struct {
 	// Your data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
-	applyCh   chan ApplyMsg
-	applyCond *sync.Cond
-	applyAble bool
-	state     Role
+	applyCh chan ApplyMsg
+
+	state Role
 	// 服务器已知最新的任期（在服务器首次启动时初始化为0，单调递增)
 	currentTerm int
 	// 当前任期内收到选票的 candidateId，如果没有投给任何候选人 则为空
@@ -97,8 +97,7 @@ type Raft struct {
 	nextIndex []int
 	// 对于每一台服务器，已知的已经复制到该服务器的最高日志条目的索引（初始值为0，单调递增）
 	matchIndex []int
-	// 开启定期发心跳的条件, 只在成为Leader时候signal
-	heartBeatCond *sync.Cond
+
 	// 最后一次收到leader消息的时间
 	lasLeaderMsgTime time.Time
 	// 超时计数器时间
@@ -210,19 +209,23 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	LOG("[ask RequestVote] %d任期为%d, 收到%d任期%d的投票请求", rf.me, rf.currentTerm, args.CandidateId, args.Term)
+	lasTerm := rf.log[len(rf.log)-1].Term
+	lasIndex := rf.log[len(rf.log)-1].Index
+	//LOG("[ask RequestVote] %d任期为%d, 收到%d任期%d的投票请求", rf.me, rf.currentTerm, args.CandidateId, args.Term)
+	//LOG("[ask RequestVote] %d任期为%d, 收到%d任期%d的投票请求", rf.me, rf.currentTerm, args.CandidateId, args.Term)
+	LOG("[ask RequestVote] %d任期为%d,votefor = %d, lasTerm = %d, lasIndex = %d, 收到投票请求args = %+v", rf.me, rf.currentTerm, rf.votedFor, lasTerm, lasIndex, args)
 	reply.VoteGranted = false
 	reply.Term = rf.currentTerm
 	// 无法接收比自己term小的节点
 	if rf.currentTerm > args.Term {
 		return
 	}
+	rf.updTerm(args.Term)
 	// 要么没投票, 要么本任期投票给了CandidateId, 且CandidateId日志比自己新
 	// todo: 什么时候会在voteFor = CandidateId的情况下再次收到它的投票请求, 且需要再次给它投票
-	lasTerm := rf.log[len(rf.log)-1].Term
-	lasIndex := rf.log[len(rf.log)-1].Index
+
 	logMoreNew := args.LastLogTerm > lasTerm || (args.LastLogTerm == lasTerm && args.LastLogIndex >= lasIndex)
-	if rf.votedFor == -1 || (rf.votedFor == args.CandidateId && logMoreNew) {
+	if (rf.votedFor == -1 || rf.votedFor == args.CandidateId) && logMoreNew {
 		rf.votedFor = args.CandidateId
 		reply.VoteGranted = true
 		// 接收了投票, 那么需要重置超时计数器
@@ -230,8 +233,6 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		rf.lasLeaderMsgTime = time.Now()
 		LOG("[agree RequestVote] %d任期为%d, 同意%d任期%d的投票请求", rf.me, rf.currentTerm, args.CandidateId, args.Term)
 	}
-
-	rf.updTerm(args.Term)
 }
 
 // call会保证rpc返回, 所以不需要自己做超时处理
@@ -250,6 +251,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		reply.Success = false
 		return
 	}
+	// 将这条语句从最后移到最前
+	rf.updTerm(args.Term)
 	// 检查receiver是否存在PreLog这条日志
 	logLen := len(rf.log)
 	if logLen-1 < args.PrevLogIndex || rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
@@ -278,11 +281,13 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			del = true
 		}
 	}
+	// LOG("[accept AppendEntries]节点%d当前日志情况%+v", rf.me, rf.log)
 	// 更新已提交的日志索引
 	if args.LeaderCommit > rf.commitIndex {
+		precommit := rf.commitIndex
 		rf.commitIndex = min(args.LeaderCommit, len(rf.log)-1)
+		LOG("[upd commit] 节点%d任期%d的commitIndex更新%d => %d", rf.me, rf.currentTerm, precommit, rf.commitIndex)
 	}
-	rf.updTerm(args.Term)
 }
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
@@ -312,7 +317,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	if rf.state == Leader {
+	if rf.state != Leader {
 		return -1, -1, false
 	}
 	rf.log = append(rf.log, LogEntry{
@@ -320,6 +325,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		Term:    rf.currentTerm,
 		Index:   len(rf.log),
 	})
+	LOG("[app entry] 接收日志[%d %d]", rf.currentTerm, len(rf.log)-1)
 	return len(rf.log) - 1, rf.currentTerm, true
 }
 
@@ -350,7 +356,7 @@ func (rf *Raft) StartElection() {
 	me := rf.me
 	term := rf.currentTerm
 	lasLog := rf.log[len(rf.log)-1]
-	halfNum := int32(len(rf.peers)-1) / 2
+	halfNum := int32(len(rf.peers)+1) / 2
 	rf.mu.Unlock()
 
 	var votes atomic.Int32
@@ -383,7 +389,7 @@ func (rf *Raft) StartElection() {
 			}
 			if reply.Term > term {
 				ASSERT(reply.VoteGranted == false)
-				// 切换回跟随者状态
+				// Todo: 切换回跟随者状态, 是否需要刷新超时计时器
 				rf.updTerm(reply.Term)
 				return
 			}
@@ -409,7 +415,11 @@ func (rf *Raft) timeoutTicker() {
 	for rf.killed() == false {
 		// 随机一个超时计数器
 		// rf.lasLeaderMsgTime = time.Now()
-		ms := 300 + (rand.Int63() % 250)
+		// ms := 200 + (rand.Int63() % 200)
+		// rand.Seed(time.Now().Unix())
+		// [250, 500]之间超时.   x秒超时,
+		ms := 120 + (rand.Int63() % 200)
+		LOG("[timeoutTicker] 节点%d %+v %d", rf.me, rf.lasLeaderMsgTime, ms)
 		for {
 			time.Sleep(10 * time.Millisecond)
 			rf.mu.Lock()
@@ -431,6 +441,8 @@ func (rf *Raft) timeoutTicker() {
 			continue
 		}
 		// 超时了, 需要转换为candidate, 并发起一轮投票请求
+		// 需要刷新lasLeaderMsgTime.
+		rf.lasLeaderMsgTime = time.Now()
 		rf.mu.Unlock()
 		go rf.StartElection()
 	}
@@ -440,7 +452,7 @@ func (rf *Raft) timeoutTicker() {
 func (rf *Raft) syncLogAndHeartBeat() {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	LOG("[Leader Sync] %d在任期%d同步日志", rf.me, rf.currentTerm)
+	LOG("[Leader Sync] %d在任期%d同步日志, %+v", rf.me, rf.currentTerm, rf.log)
 	term := rf.currentTerm
 	me := rf.me
 	commitIndex := rf.commitIndex
@@ -506,14 +518,12 @@ func (rf *Raft) syncPeerLogOne(pid int, term int, me int, commitIndex int, nxtId
 func (rf *Raft) heartBeatTicker() {
 	for !rf.killed() {
 		// 等待成为Leader
-		rf.heartBeatCond.L.Lock()
-		for !rf.IsLeader() {
-			rf.heartBeatCond.Wait()
+		for !rf.IsLeader() && !rf.killed() {
+			time.Sleep(10 * time.Millisecond)
 		}
-		rf.heartBeatCond.L.Unlock()
 		// 开始定时发心跳包
 		for {
-			if !rf.IsLeader() {
+			if !rf.IsLeader() || rf.killed() {
 				break
 			}
 			go rf.syncLogAndHeartBeat()
@@ -525,23 +535,35 @@ func (rf *Raft) heartBeatTicker() {
 // 定期将commit的日志应用到applyCh
 func (rf *Raft) applyChTicker() {
 	for !rf.killed() {
-		// 等待条件变量
-		rf.applyCond.L.Lock()
-		for !rf.applyAble {
-			rf.applyCond.Wait()
-		}
-		rf.applyCond.L.Unlock()
-
+		time.Sleep(10 * time.Millisecond)
 		rf.mu.Lock()
+		if rf.state == Leader {
+			var ma []int
+			for peer, match := range rf.matchIndex {
+				if peer == rf.me {
+					continue
+				}
+				ma = append(ma, match)
+			}
+			sort.Ints(ma)
+			if rf.commitIndex > ma[len(ma)/2] {
+				LOG("rf.commitIndex = %d, ma = %v", rf.commitIndex, ma)
+				continue
+			}
+			ASSERT(rf.commitIndex <= ma[len(ma)/2])
+			rf.commitIndex = ma[len(ma)/2]
+		}
 		for rf.lastApplied < rf.commitIndex {
 			rf.lastApplied++
+			LOG("[[[[APPLY]]]]节点%d 发送entry id = %d", rf.me, rf.lastApplied)
 			msg := ApplyMsg{
+				CommandValid: true,
 				Command:      rf.log[rf.lastApplied].Command,
 				CommandIndex: rf.log[rf.lastApplied].Index,
 			}
+			// Todo: 在发送给chan时还持有锁, 是否违反了https://pdos.csail.mit.edu/6.824/labs/raft-locking.txt的rule 4?
 			rf.applyCh <- msg
 		}
-		rf.applyAble = false
 		rf.mu.Unlock()
 	}
 }
@@ -551,6 +573,7 @@ func (rf *Raft) updTerm(term int) {
 	if rf.currentTerm < term {
 		rf.votedFor = -1
 		rf.currentTerm = term
+
 		rf.ToFollow()
 	}
 }
@@ -573,12 +596,12 @@ func (rf *Raft) ToCandidate() {
 func (rf *Raft) ToLeader() {
 	LOG("[ToLeader] %d在任期%d成功当选", rf.me, rf.currentTerm)
 	rf.state = Leader
-	rf.heartBeatCond.Signal()
 }
 
 func (rf *Raft) IsLeader() bool {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+	// Todo: 成为leader时, 是否需要初始化所有follower的nextIndex为len(rf.log)? 以及matchIndex是否要初始化?
 	return rf.state == Leader
 }
 
@@ -630,11 +653,11 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.lastApplied = 0
 
 	// 与apply相关
-	rf.applyCond = sync.NewCond(&sync.Mutex{})
-	rf.applyAble = false
+	// rf.applyCond = sync.NewCond(&sync.Mutex{})
+	// rf.applyAble = false
 	rf.applyCh = applyCh
 	// 与心跳相关
-	rf.heartBeatCond = sync.NewCond(&sync.Mutex{})
+	// rf.heartBeatCond = sync.NewCond(&sync.Mutex{})
 	// 最后一次leader消息的时间, 这个等electionTicker执行前再执行吧..
 	// rf.lasLeaderMsgTime = time.Now()
 
@@ -646,6 +669,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	LOG("[Make] %d启动...", rf.me)
 	go rf.heartBeatTicker()
 	go rf.timeoutTicker()
+
 	go rf.applyChTicker()
 	return rf
 }
