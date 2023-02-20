@@ -4,9 +4,17 @@ import "log"
 
 // Debugging
 const Debug = false
+const IM = true
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
 	if Debug {
+		log.Printf(format, a...)
+	}
+	return
+}
+
+func Im(format string, a ...interface{}) {
+	if IM {
 		log.Printf(format, a...)
 	}
 	return
