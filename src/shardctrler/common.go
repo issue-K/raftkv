@@ -1,5 +1,10 @@
 package shardctrler
 
+import (
+	"log"
+	"time"
+)
+
 //
 // Shard controler: assigns shards to replication groups.
 //
@@ -20,6 +25,20 @@ package shardctrler
 // The number of shards.
 const NShards = 10
 
+const debug = false
+
+type Operator int
+
+const ExecuteTimeout = 2000 * time.Millisecond
+
+const (
+	Join Operator = iota
+	Leave
+	Move
+	Query
+)
+
+// Config
 // A configuration -- an assignment of shards to groups.
 // Please don't change this.
 type Config struct {
@@ -29,7 +48,10 @@ type Config struct {
 }
 
 const (
-	OK = "OK"
+	OK             = "OK"
+	ErrWrongLeader = "ErrWrongLeader"
+
+	ErrTimeout = "ErrTimeout"
 )
 
 type Err string
@@ -70,4 +92,32 @@ type QueryReply struct {
 	WrongLeader bool
 	Err         Err
 	Config      Config
+}
+
+type OpRequest struct {
+	Servers  map[int][]string // for Join
+	GIDs     []int            // for Leave
+	Shard    int              // for Move
+	GID      int              // for Move
+	Num      int              // for Query
+	ClientID int64
+	OpID     int64
+	Type     Operator
+}
+
+type OpReply struct {
+	WrongLeader bool
+	Config      Config
+	Err         Err
+}
+
+type OpIdentity struct {
+	OpID  int64
+	Reply *OpReply
+}
+
+func LOG(str string, args ...interface{}) {
+	if debug {
+		log.Printf(str, args...)
+	}
 }
