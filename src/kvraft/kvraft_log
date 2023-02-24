@@ -1,0 +1,17 @@
+Test: one client (3A) ...
+2023/02/22 15:59:44 开始发送op: &{Key:0 Value: Type:1 ClientID:0 OpID:0}
+labgob warning: Decoding into a non-default variable/field Err may not work
+2023/02/22 15:59:44 [server] 将op = &{Key:0 Value: Type:1 ClientID:2445697470377241617 OpID:0} 交给raft
+panic: gob: type not registered for interface: kvraft.OpRequest
+
+goroutine 7156 [running]:
+6.5840/labrpc.(*ClientEnd).Call(0x140000e0640, {0x10233ed8f?, 0x0?}, {0x10239fe20, 0x14000306480}, {0x10239fe60, 0x140002fc450})
+	/Users/cl/code/go/6.5840/src/labrpc/labrpc.go:94 +0x294
+6.5840/raft.(*Raft).sendAppendEntries(...)
+	/Users/cl/code/go/6.5840/src/raft/raft.go:397
+6.5840/raft.(*Raft).syncPeerLogOne(0x140000ec540, 0x4, 0x1, 0x2, 0x0, 0x1, {0x140002f2380, 0x1, 0x1}, {{0x0?, ...}, ...})
+	/Users/cl/code/go/6.5840/src/raft/raft.go:646 +0x138
+created by 6.5840/raft.(*Raft).syncLogAndHeartBeat
+	/Users/cl/code/go/6.5840/src/raft/raft.go:600 +0x448
+exit status 2
+FAIL	6.5840/kvraft	0.722s

@@ -1,162 +1,90 @@
-# 6.5840 Lab 1: MapReduce
+
+
+# Lab 3: Fault-tolerant Key/Value Service
+
+​	在本实验中，您将使用实验2中的```Raft```库构建一个容错的键值对存储服务。您的键/值服务将是一个复制的状态机，由几个使用```Raft```进行复制的键/值服务器组成。你的键值对服务应该继续处理客户端请求，只要大多数服务器处于活动状态并且可以通信，即使出现其他故障或网络分区。在实验3之后，您将实现[Raft交互图](https://pdos.csail.mit.edu/6.824/notes/raft_diagram.pdf)中显示的所有部分(```Clerk, Service, and Raft```)。
+
+​	客户端可以向键值对服务发送三种不同的```rpc```请求:```Put(key, value)```、```Append(key, arg)```和```Get(key)```。该服务维护一个简单的键值对数据库。键和值都是字符串。```Put(key, value)```替换数据库中特定键对应的值，```Append(key, arg)```将```arg```添加到```key```对应的值上，```Get(key)```获取键对应的当前值。对于一个不存在的键，```Get```应该返回一个空字符串。追加一个不存在的键的行为应该类似于```Put```。每个客户端都通过一个```Clerk```使用```Put/Append/Get```方法与服务进行通信。```Clerk```管理与服务器的```RPC```交互。
+
+​	您的服务必须排列应用程序对```Clerk``` Get/Put/Append方法的调用, 以保证它们是线性化的。如果一次只调用一个方法，那么Get/Put/Append方法的行为就好像系统中只有一个状态副本，而且每次调用都应该观察前面的调用序列对状态的修改。对于并发调用，返回值和最终状态必须与按某种顺序一次执行一个操作的情况相同。如果客户端X调用了```Clerk.Put()```，客户端Y调用了```Clerk.Append()```，那么客户端X的调用就会返回。在调用开始之前，必须观察所有已经完成的调用的效果。
+
+​	线性化对于应用程序来说很方便，因为它是你在单个服务器一次处理一个请求的行为。例如，如果一个客户端成功地从服务获得更新请求的响应，那么随后从其他客户端启动的读取保证可以看到该更新的效果。对于单个服务器来说，提供线性化相对容易。如果服务是复制的，那就更难了，因为所有服务器必须为并发请求选择相同的执行顺序，必须避免使用不是最新的状态回复客户端，并且必须在失败后以保留所有已确认的客户端更新的方式恢复它们的状态。
+
+​	这个实验室有两个部分。在A部分中，您将使用Raft实现实现键/值服务，但不使用快照。在B部分中，您将使用来自```Lab 2D```的快照实现，它将允许Raft丢弃旧的日志条目。请在各部分截止日期前提交。
+
+​	你应该复习扩展版的Raft文件，特别是第7和第8部分。要获得更广泛的视角，请查看```Chubby、Paxos Made Live、Spanner、Zookeeper、Harp、Viewstamped Replication```和[Bolosky et al](https://static.usenix.org/event/nsdi11/tech/full_papers/Bolosky.pdf)。
+
+​	我们在```src/kraft```中为您提供框架代码和测试。您需要修改```kraft/client```,```kvraft /server.go```。也许还有```kraft/common.go```。
+
+### Part A: Key/value service without snapshots
+
+​	你的每一个键/值服务器(```“kvservers”```)都有一个相关联的```Raft peer```。```Clerks```将```Put()、Append()和Get()```  RPCs发送到关联```Raft```为```leader```的```kvserver```。```kvserver```代码将```Put/Append/Get```操作提交给```Raft```，因此```Raft```日志保存了一个```Put/Append/Get```操作序列。所有```kvserver```都按照顺序执行```Raft```中的操作，并将这些操作应用到它们的键/值数据库;目的是让服务器维护键/值数据库的相同副本。
+
+​	```Clerk```有时不知道哪个```kvserver```是Raft的领导者。如果```Clerk```将```RPC```发送到错误的```kvserver```，或者如果它无法到达```kvserver```，那么```Clerk```应该通过发送到不同的```kvserver```重新尝试。如果键/值服务将操作提交到它的```Raft```日志(并因此将操作应用到键/值状态机)，```leader```通过响应它的```RPC```将结果报告给```Clerk```。如果操作提交失败(例如，如果```leader```被替换了)，服务器将报告一个错误，```Clerk```将使用不同的服务器重试。
+
+​	你的```kvservers```不应该直接通信; 它们只能通过```Raft```进行交互。
+
+> Task
+>
+> ​	您的第一个任务是实现一个解决方案，它在没有丢失消息和没有故障服务器的情况下工作。
+>
+> ​	您需要向客户端的```Clerk Put/Append/Get```方法添加```rpc```发送代码。在```server.go```中实现```PutAppend()```和```Get() RPC```处理程序。这些处理程序应该使用```Start()```在```Raft```日志中输入一个```Op```;你应该在```server.go```中填写```Op```结构的定义，这样它就描述了一个```Put/Append/Get```操作。每个服务器都应该在Raft提交Op命令时执行它们，即当它们出现在applyCh上时。RPC处理程序应该注意Raft何时提交它的```Op```，然后回复```RPC```。
+>
+> ​	当您**可靠地**通过测试组中的第一个测试时，您就完成了这个任务:“One client”。
+
+​	现在，您应该修改您的代码，以继续面对网络和服务器故障。您将面临的一个问题是，```Clerk```可能必须多次发送一个```RPC```，直到它找到一个积极响应的```kvserver```。如果一个```leader```在向```Raft```日志提交一个条目后失败，那么```Clerk```可能不会收到回复，因此可以将请求重新发送给另一个```leader```。对```Clerk.put()```或```clerk.append()```的每次调用都应该只执行一次，因此您必须确保重新发送不会导致服务器执行两次请求。
+
+> Task
+>
+> ​	添加代码来处理失败，并处理重复的```Clerk```请求，包括在一个```term```内，```Clerk```向```kvserver leader```发送请求，超时等待回复，并在另一个```term```内将请求重新发送给新的```leader```。请求应该只执行一次。您的代码应该通过```go test -run 3A```测试。
 
 
 
-我们在```src/main/mrsequence.go```中为您提供了一个简单的顺序```mapreduce```实现。它在一个进程中一次运行```map```和```reduce```。我们还为您提供了两个```MapReduce```应用程序.
+### Part B: Key/value service with snapshots ([hard](https://pdos.csail.mit.edu/6.824/labs/guidance.html))
 
-```mrapps/wc.go```是一个```word-count```程序, ```mrapps/index.go```是一个文本索引器程序。
+现在的情况是，你的键/值服务器不会调用```Raft```库的```Snapshot()```方法，所以重启服务器后必须重放完整的持久```Raft```日志来恢复它的状态。现在，您将修改```kvserver```以配合```Raft```来节省日志空间，并使用```Lab 2D```中的```Raft```的```Snapshot()```减少重启时间。
 
-可以按如下顺序运行```word-count```
+测试人员将```maxraftstate```传递给```StartKVServer()```。```maxraftstate```表示以字节为单位的持久```Raft```状态的最大允许大小(包括日志，但不包括快照)。你应该比较```maxraftstate```和```persister.RaftStateSize()```。当你的```key/value```服务器检测到```Raft```状态大小接近这个阈值时，它应该通过调用Raft的```snapshot```来保存一个快照。如果```maxraftstate```为```-1```，则不需要快照。```maxraftstate```应用于```Raft```传递给```persister.Save()```的第一个参数的gob编码字节数。
 
-```shell
-$ cd ~/6.5840
-$ cd src/main
-$ go build -buildmode=plugin ../mrapps/wc.go
-$ rm mr-out*
-$ go run mrsequential.go wc.so pg*.txt
-$ more mr-out-0
-A 509
-ABOUT 2
-ACT 8
-...
-```
-
-```mrsequential.go```将其输出保留在文件```mr-out-0```中。输入来自名为```pg-xxx.txt```的文本文件。
-
-你可以看看```mrsequential.go```的代码.
-
-你也应该看看```mrapps/wc.go```来了解一个```MapReduce```程序是怎样的.
-
-### Your Job
-
-​	你的任务是实现一个分布式的```MapReduce```，它由两个程序组成:协调器(```coordinator```)和工作器(```worker```)。只有一个```coordinator```进程和一个或多个并行执行的```worker```进程。在实际系统中，```worker```会在许多不同的机器上运行，但在这个实验中，你将在一台机器上运行它们。```worker```将通过```RPC```与```coordinator```通信。每个```worker```会向```coordinator```请求任务，从一个或多个文件中读取任务的输入，执行任务，并将任务的输出写入一个或多个文件。```coordinator```应该注意到一个```worker```是否没有在合理的时间内完成其任务(在本实验为10秒)，并将相同的任务交给不同的```worker```。
-​	我们已经给了你一些代码来开始。```coordinator```和```worker```的“主要”程序在```main/mrcoordinator.go```和```main/mrworker.go```中; 不要更改这些文件. 你应该将您的实现放在```mr/coordinator.go```, ```mr/worker.go``` 和```mr/rpc.go```中.
-
-下面展示了如何在```word-count MapReduce```应用上运行你的代码。
-
-首先，确保单词计数插件是新构建的:
-
-```shell
-$ go build -buildmode=plugin ../mrapps/wc.go
-```
-
-在主目录下运行```coordinator```
-
-```shell
-$ rm mr-out*
-$ go run mrcoordinator.go pg-*.txt
-```
-
-将```pg-*.txt```参数传递给```mrcoordinator.go```作为输入文件. 每个文件对应一个“拆分”，是一个```Map```任务的输入。
-
-在一个或多个窗口中运行一些```worker```
-
-```shell
-go run mrworker.go wc.so
-```
-
-当```worker```和```coordinator```完成后，查看```mr-out-*```中的输出。当你完成实验后，输出文件的排序并集应该与顺序输出匹配，如下所示:
-
-```shell
-$ cat mr-out-* | sort | more
-A 509
-ABOUT 2
-ACT 8
-...
-```
-
-我们为您提供一个测试脚本```main/test-mr.sh```。当输入```pg-xxx.txt```文件时，测试检查```wc```和```indexer```的 MapReduce应用程序是否生成正确的输出。测试还会检查你的实现是否并行运行```Map```和```Reduce```任务，以及你的实现是否能从运行任务时崩溃的```worker```中恢复。
-
-如果你现在运行测试脚本，它会挂起，因为```coordinator```永远不会结束:
-
-```shell
-$ cd ~/6.5840/src/main
-$ bash test-mr.sh
-*** Starting wc test.
-```
+> Task
+>
+> 修改您的kvserver，以便它在持久raft状态变得太大时进行检测，然后将一个快照交给raft。当kvserver服务器重新启动时，它应该从持久性读取快照，并从快照恢复其状态。
 
 
 
-### A few rules:
-
-- ```map```阶段应该将中间```key```划分为```nReduce```个```reduce```任务的桶，其中```nReduce```是```reduce```任务的数量——```main/mrcoordinator.go```传递给```MakeCoordinator()```的参数。每个```mapper```应该创建```nReduce```个中间文件，供```reduce```任务使用。
-- ```worker```实现应该把第$X$个```reduce```任务的输出放在文件```mr-out-X```中。
-- 一个```mr-out-X```文件应该包含每个Reduce函数输出的一行。这一行应该使用 ```"%v %v"```格式生成，用```key```和```value```调用。```main/mrsequential.go```中有关于格式的具体描述.
-- 你可以修改```mr/worker.go, mr/coordinator.go,  mr/rpc.go```。你可以临时修改其他文件进行测试，但要确保你的代码能够与原始版本兼容;我们将使用原始版本进行测试。
-- ```worker```应该把```Map```的中间输出放在当前目录下的文件中，你的```worker```稍后可以把它们作为输入读取到```Reduce```任务中。
-- ```main/mrcoordinator.go```预期```mr/coordinator.go```会实现一个```Done()```方法, 当它返回```true```时代表```MapReduce```任务全部完成, 然后```mrcoordinator.go```会```exit```.
-- 当```job```完成时，```worker```进程应该退出。实现这一点的一个简单方法是使用```call()```的返回值: 如果```worker```没有联系到```coordinator```，它可以假设```coordinator```已经退出，因为工作已经完成，因此```worker```也可以终止。根据你的设计，你可能会发现设置一个```"please exit"```的伪任务让```coordinator```将其交给```worker```会很有用.
-
-### Hints
-
-- 一种开始的方式是修改```mr/worker.go```的```Worker()```来发送RPC给```coordinator```以请求任务. 然后修改```coordinator```响应一个还没有开始执行的```map```任务的文件名. 然后修改```worker```来读取这个文件并调用```application Map function```，就像```mrsequential.go```那样。
-
-- 应用程序的Map和Reduce函数是在运行时使用```Go plugin package```从以.so结尾的文件中加载的。
-
-- 当你修改```mr/```下的任何文件, 就需要重新构建你使用的所有```MapReduce```插件
-
-  ```shell
-  go build -buildmode=plugin ../mrapps/wc.go
-  ```
-
-- 这个实验依赖于```worker```共享一个文件系统。当所有```worker```进程运行在同一台机器上时，这很简单，但如果工作进程运行在不同的机器上，则需要像GFS这样的全局文件系统。
-
-- 中间文件的一个合理命名约定是```mr-X-Y```，其中```X```是Map任务号，```Y```是reduce任务号。
-
-- ```worker```的map任务代码需要在文件中存储中间的键值对，并且保证在reduce任务中可以正确读取。一种做法是使用Go的```encoding/json```包。将```JSON```格式的键值对写入打开的文件
-
-  ```go
-    enc := json.NewEncoder(file)
-    for _, kv := ... {
-      err := enc.Encode(&kv)
-  ```
-
-  写入如下所示
-
-  ```go
-    dec := json.NewDecoder(file)
-    for {
-      var kv KeyValue
-      if err := dec.Decode(&kv); err != nil {
-        break
-      }
-      kva = append(kva, kv)
-    }
-  ```
-
-- ```worker```的```map```部分可以使用```ihas(key)```函数(在```worker.go```中)选择给```reduce task```哪些```key```
-
-- 你可以从```mrsequential.go```中"借鉴"一些代码。例如读取Map输入文件，对Map和Reduce之间的键值对进行排序，以及将Reduce的输出存储在文件中。
-
-- ```coordinator```作为```rpc```的服务器是并发的, 不要忘记给数据加锁.
-
-- worker有时需要等待，例如，直到最后一个map完成，reduce才能启动。一种可能是，worker周期性地向coordinator请求工作，在每次请求之间使用time.Sleep()睡眠。另一种可能是coordinator中相关的RPC处理程序有一个等待循环，可以使用time.Sleep()或sync.Cond。Go在自己的线程中为每个RPC运行处理程序，因此一个处理程序正在等待的事实不会阻止coordinator处理其他RPC。
-
-- 协调器无法可靠地区分崩溃的worker、还活着但由于某种原因停止工作的worker，以及正在执行但速度太慢而无法发挥作用的worker。你能做的最好的事情是让协调器等待一段时间，然后放弃并重新将任务发送给另一个worker。对于这个实验室，让协调者等待十秒钟;在这之后，协调器应该假定worker已经死亡(当然，它也可能没有死亡)。
-
-- 如果你选择实现备份任务(第3.6节)，请注意，我们测试了你的代码在worker执行任务没有崩溃时不会调度多余的任务。备份任务应该只安排在一段相对较长的时间之后(例如10秒)。
-
-- 为了确保没有人在崩溃的情况下观察到部分写入的文件，那篇关于MapReduce的论文提到了使用临时文件的技巧，并在文件写入完成后原子性地重命名它。你可以使用```ioutil.TempFile```用于创建一个临时文件并使用```os.Rename```以原子性地重命名它。
+- 考虑```kvserver```应该在什么时候对其状态进行快照，以及快照中应该包括哪些内容。```Raft```使用```Save()```将每个快照连同相应的```Raft```状态存储在持久对象中。可以使用```ReadSnapshot()```读取最新存储的快照。
+- 您的```kvserver```必须能够跨检查点检测日志中的重复操作，因此用于检测这些操作的任何状态都必须包含在快照中。
+- 将快照中存储的结构的所有字段大写。
+- 你的```Raft```库中可能有这个实验室暴露的```bug```。如果您对```Raft```实现进行了更改，请确保它继续通过所有```Lab 2```测试。
+- ```Lab 3```测试的合理时间是```400```秒的实时时间和```700```秒的CPU时间。此外，执行```test -run TestSnapshotSize```应该花费少于```20```秒的实时时间。
 
 
 
-### My Implement
 
-- 将```Map```调用的输入数据切割为```M```个分区, 在本实验中, 每个分区就是一个输入文件
-- ```Worker```需要主动向```coordinator```请求任务, 然后```coordinator```会分配一个```Map```任务(指定输入文件)给它.(如果所有```Map```任务完成, 就可以分配```Reduce```任务给```Worker```).
 
-​		为了方便```Worker```退出, 当完成所有任务时, ```coordinator```可以分配一个```exit```任务让```Worker```终止.
+## Implement
 
-​		```Worker```需要周期性得向```coordinator```来请求任务, 这个可以简单的用```time.Sleep()```实现
+- 服务端的状态机使用一个内存中的```map```存储```kv```键值对
 
-- 被分配了```Map```任务的```Worker```程序读取对应的输入文件,  然后将```Map```处理后产生的中间```key```分为```nReduce```个不同的分区文件, 通知```coordinator```
-- 当所有```Map```任务完成后, ```coordinator```才能开始为```Worker```分配```reduce```任务, 并把所有分配给该```reduce```任务的中间文件名传递过去
+- 当客户端需要发出一个```rpc```时, 随机向一个```server peer```发出请求, 如果请求失败(相应```peer```不是```leader```或响应超时等错误), 就向下一个```peer```重发该```rpc```. 当然, 如果响应成功, 保存该```peer id```, 这样下次发送就不用一直找```leaderId```了
 
-- ```reduce worker```读取它需要处理的所有分区文件, 将```Reduce```调用产生的结果生成一个结果文件, 第```X```个```reduce worker```的输出文件取名为```mr-out-X```。
+- 服务端收到客户端```rpc```, 将这个```rpc```命令发送给自己对应的```raft```节点. 然后一直阻塞, 直到```raft```将这条日志提交. 此时```server```就可以把这条```rpc```应用到自己的状态机(应为其他的所有```server```也一定会按序收到这条已提交的日志), 然后才能返回客户端
 
-​		当然, ```reduce worker```完成任务后需要给```coordinator```通知
+- 如果网络一切正常, 自然没有问题. ```raft```可以保证所有节点按序提交相同的日志, 而请求总是发向```leader```节点, 总是有当前的所有日志,   并且只会把已提交的日志送往状态机.
 
-- 当```coordinator```收到所有```Reduce```任务完成的通知时, 就可以退出了.(根据你的实现, 可能需要先让```Worker```退出)
+- 现在考虑网络异常,  重新选择```leader```， 该```leader```一定拥有之前的所有日志, 但是需要考虑其对应的```server```的状态机是否包含所有已提交的日志. 如果该节点在变为```leader```前一直正常的跟随着上一个```leader```同步信息, 突然上一个```leader```断电, 甚至没来的及同步```commitIndex```信息, 那么虽然新```leader```拥有所有日志, 但```commitIndex```可能很落后. 所以一般的策略是新```leader```需要提交一条空日志, 以提交之前任期的所有日志.(```raft```节点只能提交当前任期的日志).  不过这里实现不需要修改```raft```节点了, 因为不管是```get,put,append```在这里都会变成一条日志给```raft```. 所以如果```rpc```请求都回复了, 意味着之前所有被提交的日志也都提交了并应用到状态机
 
-还有额外的一点是, 如果一个任务长时间没有得到```Worker```的响应, 需要把该任务交给另一个```Worker```完成.
+- 如果客户端每个请求只发一次, 这是正确的. 但由于网络波动, 可能客户端在发送```rpc```后等待很久都没回复, 引发超时, 此时客户端会切换到下一个```server peer```发送. 那么如果上一条请求已经被同步到```raft```, 只是响应有点慢, 那这条日志相当于发送了两次, 会被提交两次, 被状态机应用两次, 显然不符合预期.
 
+- 为此, 我们给每个请求一个唯一标识符```clientID+commandID```. 这样, 虽然相同的请求还是会被发送到```raft```, 日志会变成两条, 提交两次.
+
+  但我们在```server```层做修改, 当收到```raft```被提交的日志时, 检查该日志之前是否已经应用到状态机了, 如果是, 就不在应用, 直接返回上一次的结果.
+
+  得益于这个实验中, 客户端只能同时发送一个```rpc```(但这个```rpc```超时/错误后可以再次发送), ```server```端只需要保存每个客户端最后一次被应用的标识符```clientID+commandID```即可.
+
+**一些实现技巧与注意事项**
+
+- 使用一个线程不断从```raft```的```applyCh```获取已提交的日志
+
+- 在收到客户端请求时服务端需要把日志提交给```raft```并阻塞, 确定日志被提交才能被唤醒, 应用到状态机再返回. 这个过程可以用一个```chan```来实现.
+- 由于快照的存在, 部分比较落后的```follower```, 可能在自己提交一些较低```index```日志的同时, 中间过程```leader```直接发送快照进行同步, 导致可能```commit```一些比较旧的日志(已经包含在快照中). 所以服务端应该维护一个```lasApplied```, 只有日志大于这个值才能进行应用, 防止应用老日志.

@@ -52,6 +52,11 @@ const (
 	HeatBeatTime = 50 * time.Millisecond
 )
 
+const (
+	// FastBackUp 是否开启快速回复, 也就是在append entry rpc发生冲突时, follower回复更多信息帮助快速恢复nextIndex
+	FastBackUp = false
+)
+
 type ApplyMsg struct {
 	CommandValid bool
 	Command      interface{}
@@ -132,13 +137,6 @@ func (rf *Raft) GetState() (int, bool) {
 // (or nil if there's not yet a snapshot).
 func (rf *Raft) persist() {
 	// Your code here (2C).
-	// Example:
-	// w := new(bytes.Buffer)
-	// e := labgob.NewEncoder(w)
-	// e.Encode(rf.xxx)
-	// e.Encode(rf.yyy)
-	// raftstate := w.Bytes()
-	// rf.persister.Save(raftstate, nil)
 	w := new(bytes.Buffer)
 	e := labgob.NewEncoder(w)
 	_ = e.Encode(rf.currentTerm)
@@ -169,20 +167,6 @@ func (rf *Raft) readPersist(data []byte) {
 	if data == nil || len(data) < 1 { // bootstrap without any state?
 		return
 	}
-	// Your code here (2C).
-	// Example:
-	// r := bytes.NewBuffer(data)
-
-	// d := labgob.NewDecoder(r)
-	// var xxx
-	// var yyy
-	// if d.Decode(&xxx) != nil ||
-	//    d.Decode(&yyy) != nil {
-	//   error...
-	// } else {
-	//   rf.xxx = xxx
-	//   rf.yyy = yyy
-	// }
 	r := bytes.NewBuffer(data)
 	d := labgob.NewDecoder(r)
 	var currentTerm int
@@ -264,6 +248,9 @@ type AppendEntriesReply struct {
 	Term int
 	// 如果跟随者所含有的条目和 prevLogIndex 以及 prevLogTerm 匹配上了，则为 true
 	Success bool
+	XTerm   int
+	XIndex  int
+	XLen    int
 }
 
 type InstallSnapshotArgs struct {
@@ -313,6 +300,20 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 	return ok
 }
 
+func (rf *Raft) findFirstTermIndex(term int, index int) int {
+	ASSERT(rf.log[index].Term == term)
+	ans := index
+	for index >= 0 {
+		if rf.log[index].Term == term {
+			ans = index
+			index--
+			continue
+		}
+		break
+	}
+	return rf.log[ans].Index
+}
+
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
@@ -321,6 +322,9 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// 不接受任期比自己小的情况
 	if args.Term < rf.currentTerm {
 		reply.Success = false
+		if FastBackUp {
+			reply.XLen = -2
+		}
 		return
 	}
 	rf.updTerm(args.Term)
@@ -328,14 +332,27 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	logLen := len(rf.log)
 	// 接收者缺少PrevLogIndex日志
 	if args.PrevLogIndex < rf.log[0].Index {
-		// reply.Term = -1
 		reply.Success = false
+		if FastBackUp {
+			reply.XLen = -1 // 表示需要直接发送快照了(再发下去也只是导致nextIndex一直--, 从而触发发送快照)
+		}
 		return
 	}
 	// 如果存在PrevLogIndex, 那么应该是rf.log[id]
 	id := args.PrevLogIndex - rf.log[0].Index
 	if id > logLen-1 || rf.log[id].Term != args.PrevLogTerm {
 		reply.Success = false
+		// 1、follower的日志更短, 不存在这条日志
+		if FastBackUp {
+			if id > logLen-1 {
+				reply.XTerm = -1
+				reply.XLen = id - (logLen - 1)
+			} else {
+				// 2、存在日志, 但发生冲突
+				reply.XTerm = rf.log[id].Term
+				reply.XIndex = rf.findFirstTermIndex(reply.XTerm, id)
+			}
+		}
 		return
 	}
 	// 接收本次的日志: 1、重置超时计数器 2、转换为Follower Todo: 当自己是leader时收到该rpc应该如何处理?
@@ -347,11 +364,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// 开始同步日志
 	del := false
 	flag := false
-	//if id == 0 {
-	//	rf.log[0] = LogEntry{
-	//		Term: args.PrevLogTerm, Index: args.PrevLogIndex,
-	//	}
-	//}
 	for i := id + 1; i <= id+len(args.Entries); i++ {
 		eid := i - id - 1
 		// 如果原来没有这条日志, 或者之前某条日志冲突导致receiver之后的日志被删除, 直接append新日志即可
@@ -548,53 +560,15 @@ func (rf *Raft) StartElection() {
 					// 切换为leader, 并马上广播一次心跳
 					rf.ToLeader()
 					// 马上广播一次心跳包
-					go rf.syncLogAndHeartBeat()
+					go rf.syncLogAndHeartBeat(true)
 				}
 			}
 		}(id)
 	}
 }
 
-// 目前的超时计数器逻辑
-// 每次随机一个超时时间, 然后用time.Sleep()以一个小的参数来驱动检查是否超时
-// 当需要重置超时计数器时, 直接将rf.resetTimeout置为true, 那么当timeoutTicker发现时候
-// 就会展开新的一轮循环, 重新随机超时时间
-func (rf *Raft) timeoutTicker() {
-	rf.lasLeaderMsgTime = time.Now()
-	for rf.killed() == false {
-		// 随机一个超时计数器
-		ms := 120 + (rand.Int63() % 200)
-		// LOG("[timeoutTicker] 节点%d %+v %d", rf.me, rf.lasLeaderMsgTime, ms)
-		for {
-			time.Sleep(10 * time.Millisecond)
-			rf.mu.Lock()
-			// 判断当前超时计数器是否超时. wait为假表示超时
-			wait := rf.lasLeaderMsgTime.Add(time.Duration(ms) * time.Millisecond).After(time.Now())
-			if !wait || rf.resetTimeout {
-				rf.mu.Unlock()
-				break
-			}
-			rf.mu.Unlock()
-		}
-
-		// 超时了 or 需要重置超时计数器. 检查是哪种情况
-		rf.mu.Lock()
-		// Leader可以无视超时计数器. 否则检查是否需要重置超时计数器
-		if rf.state == Leader || rf.resetTimeout {
-			rf.resetTimeout = false
-			rf.mu.Unlock()
-			continue
-		}
-		// 超时了, 需要转换为candidate, 并发起一轮投票请求
-		// 需要刷新lasLeaderMsgTime.
-		rf.lasLeaderMsgTime = time.Now()
-		rf.mu.Unlock()
-		go rf.StartElection()
-	}
-}
-
 // 向所有peer同步日志(也用作心跳)
-func (rf *Raft) syncLogAndHeartBeat() {
+func (rf *Raft) syncLogAndHeartBeat(must bool) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	LOG("[Leader Sync] %d在任期%d同步日志, %+v", rf.me, rf.currentTerm, rf.log)
@@ -607,6 +581,9 @@ func (rf *Raft) syncLogAndHeartBeat() {
 	baseIndex := rf.log[0].Index
 	for peer := range rf.peers {
 		if peer == rf.me {
+			continue
+		}
+		if !must && nextIndex[peer] > rf.log[len(rf.log)-1].Index {
 			continue
 		}
 		var entries []LogEntry
@@ -666,6 +643,8 @@ func (rf *Raft) syncPeerLogOne(pid int, term int, me int, commitIndex int, nxtId
 	reply := &AppendEntriesReply{
 		Term:    term,
 		Success: false,
+		XLen:    0,
+		XTerm:   0,
 	}
 	ok := rf.sendAppendEntries(pid, args, reply)
 	if !ok {
@@ -688,62 +667,12 @@ func (rf *Raft) syncPeerLogOne(pid int, term int, me int, commitIndex int, nxtId
 		}
 	} else {
 		// 优化, 一次回退所有此任期的日志
-		rf.nextIndex[pid]--
-		// Todo: 先回退到0去??
-		//baseIndex := rf.log[0].Index
-		//for i := rf.nextIndex[pid] - 1 - baseIndex; i >= 0; i-- {
-		//
-		//	if rf.log[i].Term != rf.log[rf.nextIndex[pid]-1-baseIndex].Term {
-		//		rf.nextIndex[pid] = rf.log[i].Index
-		//		break
-		//	}
-		//}
-	}
-}
-
-// leader定时给peer发心跳包
-func (rf *Raft) heartBeatTicker() {
-	for !rf.killed() {
-		// 等待成为Leader
-		for !rf.IsLeader() && !rf.killed() {
-			time.Sleep(10 * time.Millisecond)
-		}
-		// 开始定时发心跳包
-		for {
-			if !rf.IsLeader() || rf.killed() {
-				break
-			}
-			go rf.syncLogAndHeartBeat()
-			time.Sleep(HeatBeatTime)
+		if FastBackUp {
+			rf.fastBackUp(pid, nxtId, reply)
+		} else {
+			rf.nextIndex[pid]--
 		}
 	}
-}
-
-// 需要先持有锁
-func (rf *Raft) updCommitIndex() {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-	if rf.state != Leader {
-		return
-	}
-	var ma []int
-	for peer, match := range rf.matchIndex {
-		if peer == rf.me {
-			continue
-		}
-		ma = append(ma, match)
-	}
-	sort.Ints(ma)
-	if rf.commitIndex > ma[len(ma)/2] {
-		LOG("rf.commitIndex = %d, ma = %v", rf.commitIndex, ma)
-		return
-	}
-	baseIndex := rf.log[0].Index
-	if rf.log[ma[len(ma)/2]-baseIndex].Term != rf.currentTerm {
-		return
-	}
-	ASSERT(rf.commitIndex <= ma[len(ma)/2])
-	rf.commitIndex = ma[len(ma)/2]
 }
 
 // 定期将commit的日志应用到applyCh
@@ -782,6 +711,132 @@ func (rf *Raft) applyChTicker() {
 	}
 }
 
+// leader定时给peer发心跳包
+func (rf *Raft) heartBeatTicker() {
+	for !rf.killed() {
+		// 等待成为Leader
+		for !rf.IsLeader() && !rf.killed() {
+			time.Sleep(10 * time.Millisecond)
+		}
+		// 开始定时发心跳包
+		count := 0
+		for {
+			if !rf.IsLeader() || rf.killed() {
+				break
+			}
+			go rf.syncLogAndHeartBeat(count%5 == 0)
+			count++
+			time.Sleep(HeatBeatTime / 5)
+		}
+	}
+}
+
+// 目前的超时计数器逻辑
+// 每次随机一个超时时间, 然后用time.Sleep()以一个小的参数来驱动检查是否超时
+// 当需要重置超时计数器时, 直接将rf.resetTimeout置为true, 那么当timeoutTicker发现时候
+// 就会展开新的一轮循环, 重新随机超时时间
+func (rf *Raft) timeoutTicker() {
+	rf.lasLeaderMsgTime = time.Now()
+	for rf.killed() == false {
+		// 随机一个超时计数器
+		// ms := 120 + (rand.Int63() % 200)
+		ms := 250 + (rand.Int63() % 300)
+		// ms := 500 + (rand.Int63() % 500)
+		// LOG("[timeoutTicker] 节点%d %+v %d", rf.me, rf.lasLeaderMsgTime, ms)
+		for {
+			time.Sleep(10 * time.Millisecond)
+			rf.mu.Lock()
+			// 判断当前超时计数器是否超时. wait为假表示超时
+			wait := rf.lasLeaderMsgTime.Add(time.Duration(ms) * time.Millisecond).After(time.Now())
+			if !wait || rf.resetTimeout {
+				rf.mu.Unlock()
+				break
+			}
+			rf.mu.Unlock()
+		}
+
+		// 超时了 or 需要重置超时计数器. 检查是哪种情况
+		rf.mu.Lock()
+		// Leader可以无视超时计数器. 否则检查是否需要重置超时计数器
+		if rf.state == Leader || rf.resetTimeout {
+			rf.resetTimeout = false
+			rf.mu.Unlock()
+			continue
+		}
+		// 超时了, 需要转换为candidate, 并发起一轮投票请求
+		// 需要刷新lasLeaderMsgTime.
+		rf.lasLeaderMsgTime = time.Now()
+		rf.mu.Unlock()
+		go rf.StartElection()
+	}
+}
+
+// 需要先持有锁
+func (rf *Raft) updCommitIndex() {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	if rf.state != Leader {
+		return
+	}
+	var ma []int
+	for peer, match := range rf.matchIndex {
+		if peer == rf.me {
+			continue
+		}
+		ma = append(ma, match)
+	}
+	sort.Ints(ma)
+	if rf.commitIndex > ma[len(ma)/2] {
+		LOG("rf.commitIndex = %d, ma = %v", rf.commitIndex, ma)
+		return
+	}
+	baseIndex := rf.log[0].Index
+	if rf.log[ma[len(ma)/2]-baseIndex].Term != rf.currentTerm {
+		return
+	}
+	ASSERT(rf.commitIndex <= ma[len(ma)/2])
+	rf.commitIndex = ma[len(ma)/2]
+}
+
+// 快读回溯nextIndex
+func (rf *Raft) fastBackUp(pid int, nxtId int, reply *AppendEntriesReply) {
+	if reply.XLen == -2 {
+		return
+	}
+	mi := rf.nextIndex[pid] - 1
+	// 1、需要直接发送快照的情况
+	if reply.XLen == -1 {
+		rf.nextIndex[pid] = min(rf.log[0].Index, mi)
+		return
+	}
+	// 2、follower日志太短, 不存在该日志条目, 需要回退XLen步
+	if reply.XTerm == -1 {
+		rf.nextIndex[pid] = min(rf.nextIndex[pid]-reply.XLen, mi)
+		return
+	}
+	// 3、follower存在该日志, 但是发生冲突
+	// 3.1 leader存在XTerm的日志, 那么直接回退到XIndex去
+	has := false
+	for i := rf.nextIndex[pid] - 1; i >= 0; i-- {
+		if rf.log[i].Term < reply.XTerm {
+			break
+		}
+		if rf.log[i].Term == reply.XTerm {
+			has = true
+		}
+		if rf.log[i].Term == reply.XTerm && rf.log[i].Index == reply.XIndex {
+			rf.nextIndex[i] = min(rf.log[i].Index+1, mi)
+			return
+		}
+	}
+	if has {
+		rf.nextIndex[pid]--
+	} else {
+		// 3.2 不存在那条日志
+		rf.nextIndex[pid] = min(reply.XIndex, mi)
+	}
+}
+
 // 调用函数前保证对rf加锁过
 func (rf *Raft) updTerm(term int) {
 	if rf.currentTerm < term {
@@ -795,6 +850,10 @@ func (rf *Raft) updTerm(term int) {
 
 func (rf *Raft) ToFollow() {
 	rf.state = Follower
+}
+
+func (rf *Raft) GetRaftStateSize() int {
+	return rf.persister.RaftStateSize()
 }
 
 // ToCandidate
@@ -841,7 +900,7 @@ func (rf *Raft) IsLeader() bool {
 // Make() must return quickly, so it should start goroutines
 // for any long-running work.
 // Todo: 加速日志匹配. 而不是日志不匹配时把nextIndex--, 这样太慢. 落后的follower需要很大代价追上来
-// Todo: 应该给每个peer起一个线程用于同步日志, 使用条件变量, 每次调用start时唤醒, 开始同步.(现在的实现必须等待心跳把日志带过去)
+// Todo: 应该给每个peer起一个线程用于同步日志, 使用条件变量, 每次调用start时唤醒, 开始同步.(现在的实现是每sleep五次发一次心跳, 每sleep一次同步一次日志.效果差不多,但有点憨憨的感觉)
 // Todo: 异步apply日志. 当leader提交日志 or follower收到leader的commitIndex更新时都需要应用日志. 仍然可以使用线程+条件变量实现 (现在的实现是在applyChTicker线程中循环检查)
 func Make(peers []*labrpc.ClientEnd, me int,
 	persister *Persister, applyCh chan ApplyMsg) *Raft {
